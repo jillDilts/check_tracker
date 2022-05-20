@@ -1,0 +1,467 @@
+---
+title: "Checklist report"
+description: |
+ 
+author:
+  - name: 
+    url: 
+date: "`r Sys.Date()`"
+output: distill::distill_article
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = FALSE,
+  message = FALSE
+)
+options(scipen = "999")
+
+library(tidyverse)
+library(lubridate) 
+library(here)
+library(plotly)
+library(hms)
+library(DT)
+
+# utilities for common 
+source( here( "scripts/utils.R" ) )
+```
+
+```{r get lastest data}
+# pull google sheets and use them to replace .rds files in /data/live
+dev_null <- refresh_data()
+
+# read .rds files from /data/live
+read_data()
+```
+
+```{r calculate variables that are based on the data }
+# list of dates that appear in the spreadsheet
+date_list <- 
+  raw_checks %>%
+  `$`(google_datetime) %>% # get the datetime column pipe-ily
+  as.Date(tz = actual_tz) %>%
+  unique()
+
+```
+
+```{r wide flat table with one row per task completion}
+# process raw_tasks file 
+tasks <-
+  raw_tasks %>%
+  mutate(
+    task_weight = 1 # for charts; lets us have a non-task that is still plotted
+  )
+
+# completions of tasks on the daily checklist
+checks <-
+  raw_checks %>%
+  # fix google datetime weirdness
+  mutate(
+    datetime =
+      force_tz(
+        time = as_datetime(
+          x = unlist(google_datetime)
+          ,tz = "UTC"
+        ),
+        tzone = actual_tz
+      ),
+    date = as.Date(
+      datetime
+      ,unit = "days"
+      ,tz = actual_tz
+    )
+  ) %>%
+  # add task details from task list
+  left_join(
+    y = tasks
+  ) %>%
+  mutate(
+    task_done = TRUE    # add column indicating task completion
+  ) %>%
+  #------------------ utility rows ---
+  bind_rows(
+    tibble(
+      datetime = date_list # + lubridate::hms( "27:59:59" ) # midnight UTC
+      ,date = date_list
+      ,task_done = TRUE
+      ,task_weight = 0
+      ,task_code = "filler"
+      ,task_name = "filler"
+    )
+  ) %>%
+  # add cumulative total checks over course of a day 
+  arrange( datetime ) %>%
+  group_by( date ) %>%
+  mutate(
+    cumu_weight = cumsum( task_weight )
+  ) %>%
+  # ---------- add unfinished tasks ---
+  # right join with list of possible date-task combinations to add un-done tasks
+  right_join(
+    # make list of possible date-task combinations
+    y = left_join(
+      x = raw_tasks 
+      ,y = tibble( date = date_list )
+      ,copy = TRUE
+      ,by = character()
+    )
+  ) %>% 
+  # fill in NAs in rows for undone tasks
+  mutate(
+    datetime = coalesce( datetime, date )
+    ,cumu_weight = replace_na( cumu_weight, 0 )
+    ,task_done = replace_na( task_done, FALSE )
+  ) %>%
+  # calculate completion rates for each task
+  group_by( task_code ) %>%
+  mutate(
+    done_rate = sum( task_done ) / length( date_list )
+  )
+
+```
+
+```{r aggregate checks by day }
+by_day <- 
+  checks %>%
+  # aggregate by day
+  group_by( date ) %>% 
+  summarize(
+    total_checks = sum( task_done == TRUE )
+  ) %>%
+  # calculate z score
+  mutate(
+    z_checks = ( total_checks - mean( total_checks ) ) / sd( total_checks )
+  ) 
+```
+
+```{r make week-level dataset}
+by_week <-
+  by_day %>%
+  # create week variable to aggregate by
+  group_by( week_start = cut( x = date, breaks = "week" ) ) %>%
+  # calculate summary stats
+  summarize(
+    week.total_checks  = sum( total_checks, na.rm = TRUE )
+    ,week.median_checks = median( total_checks, na.rm = TRUE )
+    ,week.mean_checks = mean( total_checks, na.rm = TRUE )
+    ,week.sd_checks  = sd( total_checks, na.rm = TRUE  )
+    ,week.se_checks  = week.sd_checks / sqrt( length( total_checks ) )
+  ) %>%
+  # pivot until we have one row per stat, one col per measure
+  pivot_longer(
+    cols = c(
+      -week_start
+      ,contains("sd")
+    )
+  ) %>%
+  separate( 
+    col = name
+    ,into = c("week.stat", "week.measure")
+    ,sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = week.stat
+  )
+
+
+```
+
+## Weekly Trends
+
+```{r plot weekly data}
+by_week_plot <- 
+  by_week %>%
+  # group_by( week.measure ) %>%
+  ggplot(
+    mapping = aes(
+      x = week_start
+      ,y = week.median
+      ,group = week.measure
+    )
+  ) +
+  # median tracking
+  geom_point(
+    color = "red"
+  ) +
+  geom_line(
+    color = "red"
+  ) +
+  geom_point(
+    mapping = aes(
+      y = week.mean
+    ), 
+    # color = "red"
+  ) +
+  geom_errorbar(
+    mapping = aes(
+      ymin = week.mean - week.se
+      ,ymax = week.mean + week.se
+    )
+    ,width = 0.1
+  ) +
+  facet_wrap(
+    facets = "week.measure"
+    ,ncol = 2
+    ,scales = "free_y"
+  )
+
+ggplotly(
+  by_week_plot
+)
+
+```
+
+```{r plot weekly totals}
+by_week_total_plot <- 
+  by_week %>%
+  # group_by( week.measure ) %>%
+  ggplot(
+    mapping = aes(
+      x = week_start
+      ,y = week.total
+      ,group = week.measure
+    )
+  ) +
+  geom_point(
+  ) +
+  geom_line(
+  ) +
+  facet_wrap(
+    facets = "week.measure"
+    ,ncol = 2
+    ,scales = "free_y"
+    # ,shrink = FALSE
+  )
+
+ggplotly(
+  by_week_total_plot
+)
+
+```
+
+## Daily Trends
+
+```{r fig.width=10}
+checklist_tile_plot <-
+  checks %>%
+  arrange( desc(done_rate) ) %>%
+  ggplot(
+    mapping = 
+      aes(
+        x = date
+        ,y = fct_reorder(
+          .f = task_name
+          ,.x = done_rate
+        )
+        ,fill =  as.numeric( task_done ) 
+        ,text = notes
+      )
+  ) +
+  geom_tile(
+  ) +
+  scale_x_date(
+    date_breaks = "1 day"
+  ) +
+  scale_fill_gradient(
+    low = wellbeing_palette["old_checks"]
+    ,high = wellbeing_palette["checks"]
+  ) +
+  theme(
+    axis.text.x = element_text( angle = 45, hjust = 1 ) 
+    ,legend.position = "none" #not needed as much as width is
+  ) 
+
+ggplotly( 
+  checklist_tile_plot
+  ,tooltip = 
+    c(
+      "date"
+      ,"task_name"
+      ,"notes"
+    )
+)
+```
+
+```{r mood plot}
+mood_plot <-
+  checks %>%
+  # get moods
+  filter(
+    task_code %in% 
+      # codes for the mood tasks 
+      c(
+        "am_mood"
+        ,"mid_mood"
+        ,"pm_mood"
+      )
+    , task_done == TRUE
+  ) %>%
+  # mutate( text_angle = 45 ) %>%
+  arrange( task_code ) %>%
+  ggplot(
+    mapping = 
+      aes(
+        x = date
+        ,y = task_code
+        ,fill =  measurement
+      )
+    # ,width = 1
+  ) +
+  # heat map squares
+  geom_raster(
+  ) +
+  geom_text(
+    aes(
+      label = str_wrap( notes, 9 )
+      # ,angle = text_angle # doesn't work??
+    )
+    ,angle = 22
+    # label = notes
+  ) +
+  scale_x_date(
+    date_breaks = "1 day"
+  ) +
+  scale_fill_gradient(
+    low = wellbeing_palette["old_checks"]
+    ,high = wellbeing_palette["checks"]
+    ,na.value = 0
+    ,limits = c(0, 1)
+  ) +
+  theme(
+    axis.text.x = element_text( angle = 45, hjust = 1 ) 
+  ) 
+
+# plot(mood_plot)
+
+ggplotly(
+  p = mood_plot
+  ,tooltip = c(
+    "date"
+    ,"task_name"
+    ,"measurement"
+  )
+)
+```
+
+
+```{r z score plot}
+# plot z scores
+z_plot <-
+  by_day %>%
+  select(
+    date,
+    contains("z")
+  ) %>%
+  pivot_longer(
+    cols = contains("z"),
+    names_to = "measure",
+    values_to = "z_score"
+  )  %>%
+  ggplot(
+    mapping = aes(
+      x = date
+      ,y = z_score
+      ,colour = measure
+      ,group = measure
+    )
+  ) +
+  geom_point() +
+  # geom_smooth(
+  #   se = FALSE
+  #   ,span = 1
+  #   ) +
+  geom_line() +
+  geom_hline(
+    yintercept = 0
+  ) +
+  scale_y_continuous(
+    limits = c(-3.5, 3.5) # 0.9995 probability if I'm normally distributed
+  ) +
+  scale_colour_manual(
+    name = "Measure name",
+    values = wellbeing_palette
+  )
+
+# z_plot
+ggplotly(
+  p = z_plot
+  # ,tooltip = c(
+  #   "datetime"
+  #   # ,""
+  # )
+)
+```
+
+## Hourly Trends
+
+```{r hourly checklist plot}
+by_hour <- 
+  checks %>%
+  filter(
+    as_hms( datetime ) != 0
+  ) %>%
+  mutate(
+    done_time = as_hms( datetime )
+    ,done_time_text = as.character( done_time )
+  ) 
+
+by_hour_plot <- 
+  by_hour %>%
+  group_by( date ) %>%
+  ggplot(
+    mapping = aes(
+      x = done_time
+      ,y = cumu_weight
+      ,colour = date
+      # ,text = done_time_text
+    )
+  ) + 
+  geom_line() +
+  geom_point( 
+    data = filter( by_hour, date == today() )
+  ) +
+  # smoother based on past 7 days
+  geom_smooth(
+    data = filter( by_hour, date >= today() - 6 )
+    ,mapping = aes(
+      group = NULL
+    )
+    ,method = "lm"
+    ,se = FALSE
+    ,colour = wellbeing_palette["checks"]
+  ) +
+  # 30-day linear smoother
+  # geom_smooth(
+  #   data = filter( hourly_checks, date >= today() - 29 )
+  #   ,mapping = aes(
+  #     group = NULL
+  #   )
+  #   ,method = "lm"
+  #   # ,se = FALSE
+  #   ,colour = wellbeing_palette["old_checks"]
+  # ) +
+  scale_colour_gradient(
+    low = wellbeing_palette["old_checks"]
+    ,high = wellbeing_palette["checks"]
+    ,name = "Date"
+    ,labels = date_list
+    ,breaks = date_list
+  )
+
+ggplotly( 
+  p = by_hour_plot 
+  ,tooltip = 
+    c(
+      "date"
+      ,"cumu_weight"
+      ,"done_time"
+    )
+)
+```
+
+```{r empty chunk}
+
+```
+
